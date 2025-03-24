@@ -1,2 +1,4 @@
 /detection/dataset/
 /detection/results/
+/detection/models/
+/recognition/models/
