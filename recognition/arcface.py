@@ -1,193 +1,170 @@
+import os
 import cv2
 import numpy as np
-import pickle
-import os
+import pandas as pd
+import argparse
+import matplotlib.pyplot as plt
+from sklearn.metrics import accuracy_score, roc_auc_score, confusion_matrix
 
-MODEL_FILENAME = "trained/arcface_model.pkl"  # Path for saving/loading the recognizer state
-RECOGNITION_THRESHOLD = 0.3  # Cosine distance threshold (adjust based on empirical results)
-
-# =============================================================================
-# Face Detector using YuNet (OpenCV implementation)
-# =============================================================================
-class FaceDetectorYunet:
-    def __init__(self, model_path="../detection/models/face_detection_yunet_2023mar.onnx", input_size=(0, 0),
-                 score_threshold=0.5):
-        self.detector = cv2.FaceDetectorYN_create(model_path, "", input_size, score_threshold)
-        self.input_size = input_size
-
-    def detect(self, image):
-        h, w = image.shape[:2]
-        self.detector.setInputSize((w, h))
-        _, faces = self.detector.detect(image)
-        return faces
-
-# =============================================================================
-# Face Recognizer using ArcFace
-# =============================================================================
 class FaceRecognizerArcFace:
-    def __init__(self, model_path="models/arcfaceresnet100-8.onnx", recognition_threshold=RECOGNITION_THRESHOLD):
+    def __init__(self, model_path="models/arcfaceresnet100-8.onnx", recognition_threshold=0.3):
         self.model_path = model_path
         self.model = cv2.dnn.readNetFromONNX(model_path)
-        self.features_database = []  # List of normalized embeddings for known faces.
-        self.labels = []             # Corresponding labels.
         self.recognition_threshold = recognition_threshold
-
-    def __getstate__(self):
-        state = self.__dict__.copy()
-        state['model'] = None
-        return state
-
-    def __setstate__(self, state):
-        self.__dict__.update(state)
-        if self.model is None:
-            self.model = cv2.dnn.readNetFromONNX(self.model_path)
+        self.face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
 
     def preprocess(self, face_image):
-        """
-        Preprocesses the face image for ArcFace.
-        Converts BGR to RGB, resizes to 112x112,
-        and normalizes pixel values to the range [-1, 1] by using:
-            output = (image - 127.5) / 128
-        which is a common preprocessing for ArcFace models.
-        """
         face_rgb = cv2.cvtColor(face_image, cv2.COLOR_BGR2RGB)
         face_resized = cv2.resize(face_rgb, (112, 112))
         blob = cv2.dnn.blobFromImage(face_resized)
         return blob
 
-    def extract_features(self, face_image):
-        blob = self.preprocess(face_image)
+    def detect_and_crop_face(self, image):
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        faces = self.face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5)
+        if len(faces) == 0:
+            return None
+        x, y, w, h = faces[0]
+        face = image[y:y+h, x:x+w]
+        return face
+
+    def extract_features(self, image):
+        face = self.detect_and_crop_face(image)
+        if face is None:
+            return None
+        blob = self.preprocess(face)
         self.model.setInput(blob)
-        embedding = self.model.forward()  # Expected shape: (1, embedding_size)
-        embedding = embedding.flatten()
+        embedding = self.model.forward().flatten()
         norm = np.linalg.norm(embedding)
         if norm > 0:
             embedding = embedding / norm
         return embedding
 
-    def add_training_sample(self, face_image, label):
-        embedding = self.extract_features(face_image)
-        self.features_database.append(embedding)
-        self.labels.append(label)
+def load_image(image_path):
+    image = cv2.imread(image_path)
+    if image is None:
+        raise ValueError(f"Image not found: {image_path}")
+    return image
 
-    def recognize(self, face_image):
-        embedding = self.extract_features(face_image)
-        if len(self.features_database) == 0:
-            return "Unknown", 1.0
-        similarities = np.array([np.dot(embedding, feat) for feat in self.features_database])
-        distances = 1 - similarities  # Cosine distance for normalized vectors.
-        min_index = np.argmin(distances)
-        min_distance = distances[min_index]
-        recognized_label = self.labels[min_index]
-        return recognized_label, min_distance
+def compute_cosine_distance(emb1, emb2):
+    similarity = np.dot(emb1, emb2)
+    return 1 - similarity
 
-# =============================================================================
-# Utility functions for saving and loading the model state.
-# =============================================================================
-def save_model(recognizer, filename=MODEL_FILENAME):
-    os.makedirs(os.path.dirname(filename), exist_ok=True)
-    with open(filename, "wb") as f:
-        pickle.dump(recognizer, f)
-    print("Model state saved to", filename)
-
-def load_model(filename=MODEL_FILENAME):
-    if os.path.exists(filename):
-        with open(filename, "rb") as f:
-            recognizer = pickle.load(f)
-        print("Model state loaded from", filename)
-        return recognizer
-    else:
-        return None
-
-# =============================================================================
-# Main script: live camera face detection, training, and recognition pipeline
-# =============================================================================
-def main():
-    cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
-        print("Error: Unable to open camera.")
-        return
-
-    face_detector = FaceDetectorYunet()
-    face_recognizer = load_model() or FaceRecognizerArcFace()
-
-    training_mode = False
-    target_training_samples = 250  # Adjust as needed.
-    current_label = None
-    training_sample_count = 0
-
-    print("Press 'T' to start training mode with a new label. Press 'q' to quit.")
-
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-
-        faces = face_detector.detect(frame)
-
-        if training_mode:
-            if faces is not None and len(faces) > 0:
-                x, y, w, h = faces[0][0:4].astype(int)
-                if x < 0 or y < 0 or x + w > frame.shape[1] or y + h > frame.shape[0]:
-                    continue
-                face_roi = frame[y:y+h, x:x+w]
-                if face_roi.size == 0:
-                    continue
-                # Add training sample
-                face_recognizer.add_training_sample(face_roi, current_label)
-                training_sample_count += 1
-                cv2.putText(frame, f"Training {current_label}: {training_sample_count}/{target_training_samples}",
-                            (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2)
-                cv2.rectangle(frame, (x, y), (x+w, y+h), (255, 0, 0), 2)
-
-            if training_sample_count >= target_training_samples:
-                training_mode = False
-                training_sample_count = 0
-                save_model(face_recognizer)
-                print(f"ArcFace model updated with label '{current_label}'. Returning to recognition mode.")
-
+def parse_pairs_csv(csv_path, lfw_root):
+    df = pd.read_csv(csv_path)
+    pairs = []
+    for index, row in df.iterrows():
+        non_nan = row.dropna()
+        if len(non_nan) == 3:
+            name = str(non_nan.iloc[0]).strip()
+            imagenum1 = int(non_nan.iloc[1])
+            imagenum2 = int(non_nan.iloc[2])
+            img1 = os.path.join(lfw_root, name, f"{name}_{str(imagenum1).zfill(4)}.jpg")
+            img2 = os.path.join(lfw_root, name, f"{name}_{str(imagenum2).zfill(4)}.jpg")
+            label = 1
+            pairs.append((img1, img2, label))
+        elif len(non_nan) == 4:
+            name1 = str(non_nan.iloc[0]).strip()
+            imagenum1 = int(non_nan.iloc[1])
+            name2 = str(non_nan.iloc[2]).strip()
+            imagenum2 = int(non_nan.iloc[3])
+            img1 = os.path.join(lfw_root, name1, f"{name1}_{str(imagenum1).zfill(4)}.jpg")
+            img2 = os.path.join(lfw_root, name2, f"{name2}_{str(imagenum2).zfill(4)}.jpg")
+            label = 0
+            pairs.append((img1, img2, label))
         else:
-            if len(face_recognizer.features_database) == 0:
-                cv2.putText(frame, "No training data", (10, 30),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-            if faces is not None:
-                for face in faces:
-                    x, y, w, h = face[0:4].astype(int)
-                    if x < 0 or y < 0 or x + w > frame.shape[1] or y + h > frame.shape[0]:
-                        continue
-                    face_roi = frame[y:y+h, x:x+w]
-                    if face_roi.size == 0:
-                        continue
-                    try:
-                        label, distance = face_recognizer.recognize(face_roi)
-                        if distance < face_recognizer.recognition_threshold:
-                            cv2.putText(frame, f"{label} ({distance:.2f})", (x, y-10),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-                        else:
-                            cv2.putText(frame, f"Unknown ({distance:.2f})", (x, y-10),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
-                    except Exception as e:
-                        cv2.putText(frame, "Recognition error", (x, y-10),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
-                    cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 255, 0), 2)
+            print(f"Fila {index} con formato inesperado: {row}")
+    return pairs
 
-        cv2.imshow("Camera Feed", frame)
-        key = cv2.waitKey(1) & 0xFF
+def plot_distances(distances, labels, threshold):
+    pos_d = [d for d, l in zip(distances, labels) if l == 1]
+    neg_d = [d for d, l in zip(distances, labels) if l == 0]
+    plt.figure(figsize=(8, 4))
+    plt.hist(pos_d, bins=50, alpha=0.6, label="Misma persona")
+    plt.hist(neg_d, bins=50, alpha=0.6, label="Distinta persona")
+    plt.axvline(threshold, color='red', linestyle='--', label=f"Umbral = {threshold:.3f}")
+    plt.xlabel("Distancia coseno")
+    plt.ylabel("Frecuencia")
+    plt.title("Distribución de distancias")
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
 
-        if key == ord('q'):
-            break
-        if key in [ord('T'), ord('t')]:
-            if not training_mode:
-                current_label = input("Enter label for training: ").strip()
-                if current_label == "":
-                    print("Empty label. Training mode not activated.")
-                else:
-                    training_mode = True
-                    training_sample_count = 0
-                    print(f"Training mode activated for label '{current_label}'. Collecting training images...")
+def find_best_threshold(distances, labels):
+    thresholds = np.linspace(0.2, 0.8, 100)
+    best_acc = 0
+    best_thresh = 0
+    for t in thresholds:
+        preds = [1 if d < t else 0 for d in distances]
+        acc = accuracy_score(labels, preds)
+        if acc > best_acc:
+            best_acc = acc
+            best_thresh = t
+    return best_thresh, best_acc
 
-    cap.release()
-    cv2.destroyAllWindows()
+def validate_arcface(recognizer, pairs, threshold=None):
+    y_true = []
+    y_pred = []
+    distances = []
+    used_threshold = threshold if threshold is not None else recognizer.recognition_threshold
+
+    for idx, (img1_path, img2_path, label) in enumerate(pairs):
+        try:
+            img1 = load_image(img1_path)
+            img2 = load_image(img2_path)
+            emb1 = recognizer.extract_features(img1)
+            emb2 = recognizer.extract_features(img2)
+            if emb1 is None or emb2 is None:
+                print(f"Omitiendo par {idx} por falta de detección facial.")
+                continue
+            distance = compute_cosine_distance(emb1, emb2)
+            pred = 1 if distance < used_threshold else 0
+            y_true.append(label)
+            y_pred.append(pred)
+            distances.append(distance)
+            print(f"Par {idx}: {os.path.basename(img1_path)} vs {os.path.basename(img2_path)} | Distancia = {distance:.3f} | Label = {label} | Prediccion = {pred}")
+        except Exception as e:
+            print(f"Error en par {idx}: {e}")
+            continue
+
+    accuracy_val = accuracy_score(y_true, y_pred)
+    try:
+        roc_auc = roc_auc_score(y_true, [-d for d in distances])
+    except Exception as e:
+        print(f"Error al calcular ROC AUC: {e}")
+        roc_auc = None
+    conf_matrix = confusion_matrix(y_true, y_pred)
+    metrics = {
+        'accuracy': accuracy_val,
+        'roc_auc': roc_auc,
+        'confusion_matrix': conf_matrix,
+        'distances': distances,
+        'y_true': y_true
+    }
+    return metrics
+
+def main():
+    parser = argparse.ArgumentParser(description="Validacion LFW para ArcFace con preprocesamiento correcto")
+    parser.add_argument("--pairs_csv", type=str, default="dataset/lfw/pairs.csv", help="Ruta al archivo CSV con pares de imágenes")
+    parser.add_argument("--lfw_root", type=str, default="dataset/lfw/lfw-deepfunneled", help="Directorio raíz de las imágenes LFW funneled")
+    parser.add_argument("--model_path", type=str, default="models/arcfaceresnet100-8.onnx", help="Ruta al modelo ONNX")
+    parser.add_argument("--threshold", type=float, default=0.6, help="Umbral inicial de distancia coseno")
+    args = parser.parse_args()
+
+    recognizer = FaceRecognizerArcFace(model_path=args.model_path, recognition_threshold=args.threshold)
+    pairs = parse_pairs_csv(args.pairs_csv, args.lfw_root)
+    metrics = validate_arcface(recognizer, pairs, threshold=args.threshold)
+
+    print("\nResultados de la validacion:")
+    print(f"Accuracy: {metrics['accuracy']*100:.2f}%")
+    if metrics['roc_auc'] is not None:
+        print(f"ROC AUC: {metrics['roc_auc']:.3f}")
+    print("Matriz de confusion:")
+    print(metrics['confusion_matrix'])
+
+    plot_distances(metrics['distances'], metrics['y_true'], args.threshold)
+    best_t, best_acc = find_best_threshold(metrics['distances'], metrics['y_true'])
+    print(f"\nUmbral optimo encontrado: {best_t:.4f} con Accuracy: {best_acc*100:.2f}%")
 
 if __name__ == "__main__":
     main()

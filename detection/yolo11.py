@@ -13,13 +13,14 @@ def main():
     wider_val_images = r"dataset\WIDER_val\images"  # <--- Adjust to your path
 
     # 2) Output folder for .txt detection files
-    output_results_dir = r"results\yolov8l"
+    output_results_dir = r"results\yolov5s"
     if not os.path.exists(output_results_dir):
         os.makedirs(output_results_dir)
 
     # 3) Load YOLOv11-l model
-    model_path = "models/yolov8l-face.pt"  # <--- Replace with the path to your YOLOv11-l weights
+    model_path = "models/face_detection_yolov5su.pt"
     model = YOLO(model_path)
+    model.to("cuda")
 
     # 4) Gather subfolders (like 0--Parade, 1--Handshaking, etc.)
     subfolders = [
