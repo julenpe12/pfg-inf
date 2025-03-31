@@ -1,4 +1,4 @@
-import cv2 
+import cv2
 import numpy as np
 import pickle
 import os
@@ -10,8 +10,8 @@ import torch
 import torchvision.transforms as transforms
 from PIL import Image
 
-MODEL_FILENAME = "trained/arcface_model.pkl"  # Path for saving/loading the recognizer state
-RECOGNITION_THRESHOLD = 0.3  # Cosine distance threshold (adjust based on empirical results)
+MODEL_FILENAME = "trained/mobilefacenet_model.pkl"  # File to save/load recognizer state
+RECOGNITION_THRESHOLD = 0.3  # Cosine distance threshold
 
 # =============================================================================
 # Face Detector using Haar Cascade
@@ -30,48 +30,43 @@ class FaceDetectorHaar:
         return faces
 
 # =============================================================================
-# Face Recognizer using ArcFace
+# Face Recognizer using MobileFaceNet TorchScript
 # =============================================================================
-import cv2
-import numpy as np
-import torch
-import torchvision.transforms as transforms
-from PIL import Image
-
-class FaceRecognizerArcFaceTorch:
-    def __init__(self, model_path="models/arcface.pt", recognition_threshold=0.3, device='cuda'):
+class FaceRecognizerMobileFaceNetTorch:
+    def __init__(self, model_path="models/mobilefacenet_scripted.pt", recognition_threshold=RECOGNITION_THRESHOLD, device='cuda'):
         self.device = device if torch.cuda.is_available() else 'cpu'
         self.model_path = model_path
+        # Load the TorchScript MobileFaceNet model.
         self.model = torch.jit.load(model_path, map_location=self.device)
         self.model.to(self.device)
         self.model.eval()
-        self.features_database = []  # List of normalized embeddings for known faces.
-        self.labels = []             # Corresponding labels.
+        self.features_database = []  # List to store normalized embeddings.
+        self.labels = []             # Corresponding labels for the embeddings.
         self.recognition_threshold = recognition_threshold
-        
-        # Define preprocessing transform
+
+        # Define preprocessing: MobileFaceNet expects 112x112 images.
         self.transform = transforms.Compose([
             transforms.Resize((112, 112)),
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
         ])
-    
+
     def __getstate__(self):
         state = self.__dict__.copy()
-        # Remove the non-picklable model from the state.
+        # Remove non-picklable model from the state.
         state['model'] = None
         return state
 
     def __setstate__(self, state):
         self.__dict__.update(state)
-        # Reload the model if it is missing.
+        # Reload the model if missing.
         if self.model is None:
             self.model = torch.jit.load(self.model_path, map_location=self.device)
             self.model.to(self.device)
             self.model.eval()
 
     def preprocess(self, face_image):
-        # Convert the face ROI (numpy array) to a PIL image.
+        # Convert face ROI (numpy array) to a PIL image.
         pil_image = Image.fromarray(cv2.cvtColor(face_image, cv2.COLOR_BGR2RGB))
         tensor = self.transform(pil_image).unsqueeze(0)  # Add batch dimension.
         return tensor.to(self.device)
@@ -95,15 +90,16 @@ class FaceRecognizerArcFaceTorch:
         embedding = self.extract_features(face_image)
         if len(self.features_database) == 0:
             return "Unknown", 1.0
+        # Compute cosine similarity (distance = 1 - dot product for normalized vectors).
         similarities = np.array([np.dot(embedding, feat) for feat in self.features_database])
-        distances = 1 - similarities  # Cosine distance for normalized vectors.
+        distances = 1 - similarities
         min_index = np.argmin(distances)
         min_distance = distances[min_index]
         recognized_label = self.labels[min_index]
         return recognized_label, min_distance
 
 # =============================================================================
-# Utility functions for saving and loading the model state.
+# Utility functions to save/load the recognizer state.
 # =============================================================================
 def save_model(recognizer, filename=MODEL_FILENAME):
     os.makedirs(os.path.dirname(filename), exist_ok=True)
@@ -121,7 +117,7 @@ def load_model(filename=MODEL_FILENAME):
         return None
 
 # =============================================================================
-# Main script: live camera face detection, training, and recognition pipeline
+# Main script: live camera face detection, training, and recognition
 # =============================================================================
 def main():
     cap = cv2.VideoCapture(0)
@@ -130,16 +126,16 @@ def main():
         return
 
     face_detector = FaceDetectorHaar()
-    face_recognizer = load_model() or FaceRecognizerArcFaceTorch()
+    face_recognizer = load_model() or FaceRecognizerMobileFaceNetTorch()
 
     training_mode = False
-    target_training_samples = 250  # Adjust as needed.
+    target_training_samples = 250  # Number of samples to collect per label.
     current_label = None
     training_sample_count = 0
 
     print("Press 'T' to start training mode with a new label. Press 'q' to quit.")
 
-    # Initialize system metrics
+    # Initialize system metrics.
     process = psutil.Process(os.getpid())
     logical_cores = psutil.cpu_count(logical=True)
     prev_frame_time = time.time()
@@ -184,8 +180,14 @@ def main():
             else:
                 avg_gpu = 0.0
 
+        # -------------------------
+        # Face Detection
+        # -------------------------
         faces = face_detector.detect(frame)
 
+        # -------------------------
+        # Training Mode: Collect embeddings with label.
+        # -------------------------
         if training_mode:
             if faces is not None and len(faces) > 0:
                 x, y, w, h = faces[0][0:4].astype(int)
@@ -194,11 +196,10 @@ def main():
                 face_roi = frame[y:y+h, x:x+w]
                 if face_roi.size == 0:
                     continue
-                # Measure inference time for training sample extraction
                 start_inf = time.time()
                 face_recognizer.add_training_sample(face_roi, current_label)
                 end_inf = time.time()
-                inf_time = (end_inf - start_inf) * 1000  # in milliseconds
+                inf_time = (end_inf - start_inf) * 1000  # Inference time in ms.
                 inf_time_buffer.append(inf_time)
                 avg_inf_time = sum(inf_time_buffer) / len(inf_time_buffer)
 
@@ -211,9 +212,13 @@ def main():
                 training_mode = False
                 training_sample_count = 0
                 save_model(face_recognizer)
-                print(f"ArcFace model updated with label '{current_label}'. Returning to recognition mode.")
+                print(f"MobileFaceNet model updated with label '{current_label}'. Returning to recognition mode.")
 
+        # -------------------------
+        # Recognition Mode
+        # -------------------------
         else:
+            avg_inf_time = 0
             if len(face_recognizer.features_database) == 0:
                 cv2.putText(frame, "No training data", (10, 30),
                             cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
@@ -229,7 +234,7 @@ def main():
                         start_inf = time.time()
                         label, distance = face_recognizer.recognize(face_roi)
                         end_inf = time.time()
-                        inf_time = (end_inf - start_inf) * 1000  # in milliseconds
+                        inf_time = (end_inf - start_inf) * 1000
                         inf_time_buffer.append(inf_time)
                         avg_inf_time = sum(inf_time_buffer) / len(inf_time_buffer)
                         if distance < face_recognizer.recognition_threshold:
@@ -244,7 +249,7 @@ def main():
                     cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 255, 0), 2)
 
         # -------------------------
-        # Overlay Metrics on Frame (Top-LEFT Corner)
+        # Overlay Metrics on Frame
         # -------------------------
         text_x = 7
         cv2.putText(frame, f"FPS: {int(avg_fps)}", (text_x, 30),
